@@ -28,6 +28,31 @@ def s_frame(recv: int) -> str:
     return (bytes([0x68, 4]) + body).hex()
 
 
+def rc_i(send: int, recv: int, cot: int, *, direction="client",
+         coa=1, ioa=10, scs=1, qoc=0x80, pn=False) -> str:
+    """携带 Type 45 C_SC_NA_1 单对象遥控 ASDU 的 I 帧（无时间戳版本见带 ts 包装）。"""
+    cot_low = cot | (0x40 if pn else 0)
+    asdu = bytes([
+        45, 1, cot_low, 0,
+        coa & 0xFF, (coa >> 8) & 0xFF,
+        ioa & 0xFF, (ioa >> 8) & 0xFF, (ioa >> 16) & 0xFF,
+        scs, qoc,
+    ])
+    body = bytes([
+        (send << 1) & 0xFF, (send << 1) >> 8,
+        (recv << 1) & 0xFF, (recv << 1) >> 8,
+    ]) + asdu
+    return (bytes([0x68, len(body)]) + body).hex()
+
+
+def rc_frame(send, recv, cot, *, ts, direction="client", **kw):
+    frame = {"direction": direction, "apdu": rc_i(send, recv, cot,
+                                                  direction=direction, **kw)}
+    if ts is not None:
+        frame["capturedAtUs"] = ts
+    return frame
+
+
 STARTDT_ACT = "680407000000"
 STARTDT_CON = "68040b000000"
 STOPDT_ACT = "680413000000"
@@ -137,6 +162,129 @@ def main() -> int:
           status == 422 and err.get("code") == "INVALID_APDU"
           and err.get("frameIndex") == 0,
           f"{status} {err}")
+
+    # 5. 旧会话回归：省略 remoteControl 时成功结果不含 completed/rejected
+    status, data = post(legal)
+    result = data.get("result", {})
+    check("省略 remoteControl 时保留原结果字段（无 completed/rejected）",
+          status == 200 and "completed" not in result and "rejected" not in result,
+          str(result))
+
+    # 6. 合法遥控：两个不同信息对象的 Type 45 选择/执行/终止链路交错完成
+    rc_legal = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 100000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 0},
+            rc_frame(0, 0, 6, ioa=10, qoc=0x80, ts=100),
+            rc_frame(1, 0, 6, ioa=20, qoc=0x80, ts=101),
+            rc_frame(0, 2, 7, ioa=10, qoc=0x80, ts=102, direction="server"),
+            rc_frame(1, 2, 7, ioa=20, qoc=0x80, ts=103, direction="server"),
+            rc_frame(2, 1, 6, ioa=10, qoc=0x00, ts=110),
+            rc_frame(3, 1, 6, ioa=20, qoc=0x00, ts=111),
+            rc_frame(2, 4, 7, ioa=10, qoc=0x00, ts=120, direction="server"),
+            rc_frame(3, 4, 7, ioa=20, qoc=0x00, ts=121, direction="server"),
+            rc_frame(4, 4, 10, ioa=10, qoc=0x00, ts=130, direction="server"),
+            rc_frame(5, 4, 10, ioa=20, qoc=0x00, ts=131, direction="server"),
+        ],
+    }
+    status, data = post(rc_legal)
+    result = data.get("result", {})
+    check("合法交错遥控链路返回 200", status == 200, f"{status} {data}")
+    check("两条遥控链路均 completed",
+          result.get("completed") == 2 and result.get("rejected") == 0,
+          str(result.get("completed")) + "/" + str(result.get("rejected")))
+
+    # 7. 负确认：选择否定确认结束操作并计为 rejected
+    rc_rejected = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 100000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 0},
+            rc_frame(0, 0, 6, ioa=10, qoc=0x80, ts=100),
+            rc_frame(0, 1, 7, ioa=10, qoc=0x80, pn=True, ts=110,
+                     direction="server"),
+        ],
+    }
+    status, data = post(rc_rejected)
+    result = data.get("result", {})
+    check("选择负确认返回 200 且计为 rejected",
+          status == 200 and result.get("rejected") == 1
+          and result.get("completed") == 0,
+          f"{status} {result}")
+
+    # 8. 非法遥控链路：控制域合法但执行激活缺少选择证据
+    rc_no_select = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 100000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 0},
+            rc_frame(0, 0, 6, ioa=10, qoc=0x00, ts=100),  # 直接执行
+        ],
+    }
+    status, data = post(rc_no_select)
+    err = data.get("error", {})
+    check("无选择证据的执行返回 REMOTE_CONTROL_MISMATCH",
+          status == 422 and err.get("code") == "REMOTE_CONTROL_MISMATCH"
+          and err.get("frameIndex") == 2,
+          f"{status} {err}")
+
+    # 9. 非法遥控链路：选择/执行/确认齐全但会话结束仍缺激活终止
+    rc_no_term = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 100000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 0},
+            rc_frame(0, 0, 6, ioa=10, qoc=0x80, ts=100),
+            rc_frame(0, 1, 7, ioa=10, qoc=0x80, ts=110, direction="server"),
+            rc_frame(1, 1, 6, ioa=10, qoc=0x00, ts=120),
+            rc_frame(1, 2, 7, ioa=10, qoc=0x00, ts=130, direction="server"),
+        ],
+    }
+    status, data = post(rc_no_term)
+    err = data.get("error", {})
+    check("缺激活终止返回 REMOTE_CONTROL_UNTERMINATED 且定位选择帧",
+          status == 422 and err.get("code") == "REMOTE_CONTROL_UNTERMINATED"
+          and err.get("frameIndex") == 2,
+          f"{status} {err}")
+
+    # 10. 非法遥控链路：选择正确认后超过时限才执行
+    rc_timeout = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 1000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 0},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 0},
+            rc_frame(0, 0, 6, ioa=10, qoc=0x80, ts=100),
+            rc_frame(0, 1, 7, ioa=10, qoc=0x80, ts=110, direction="server"),
+            rc_frame(1, 1, 6, ioa=10, qoc=0x00, ts=2000),
+        ],
+    }
+    status, data = post(rc_timeout)
+    err = data.get("error", {})
+    check("超时限执行返回 REMOTE_CONTROL_TIMEOUT 且定位选择帧",
+          status == 422 and err.get("code") == "REMOTE_CONTROL_TIMEOUT"
+          and err.get("frameIndex") == 2,
+          f"{status} {err}")
+
+    # 11. 参数边界：maxSelectDelayUs 越界返回 INVALID_REQUEST
+    for bad_delay in (0, 60_000_001):
+        status, data = post({
+            "maxWindow": 16,
+            "remoteControl": {"maxSelectDelayUs": bad_delay},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT},
+                {"direction": "server", "apdu": STARTDT_CON},
+            ],
+        })
+        err = data.get("error", {})
+        check(f"maxSelectDelayUs={bad_delay} 返回 INVALID_REQUEST/400",
+              status == 400 and err.get("code") == "INVALID_REQUEST",
+              f"{status} {err}")
 
     print("全部冒烟通过")
     return 0

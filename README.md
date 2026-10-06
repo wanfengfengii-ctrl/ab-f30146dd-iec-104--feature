@@ -27,6 +27,7 @@
 | `frames[].apdu` | 完整十六进制 APDU（起始符 0x68 + 长度 + 4 字节控制域 [+ ASDU]，允许空白分隔） |
 | `frames[].capturedAtUs` | 可选，非负整数微秒时间戳 |
 | `maxWindow` | 最大未确认窗口，1–16383 |
+| `remoteControl.maxSelectDelayUs` | 可选，1–60000000 微秒；省略时不裁决遥控；提供后启用 Type 45 单对象遥控证据链裁决 |
 
 成功响应（200）：
 
@@ -48,6 +49,12 @@
 - `iFrames`：按方向统计 I 帧数。
 - `outstanding`：会话结束时各方向已发送但尚未被对端确认的 I 帧数。
 - `handshakes`：三类 U 格式服务的 act、con 总数及成功反向配对次数。
+
+启用遥控裁决（请求带 `remoteControl.maxSelectDelayUs`）时，`result` 新增：
+
+- `completed`：证据链完整（选择激活→选择正确认→执行激活→执行正确认→激活终止）
+  的 Type 45 单对象遥控操作数；省略配置时不返回该字段。
+- `rejected`：被负确认（P/N=1 的激活确认）终结的操作数；省略配置时不返回该字段。
 
 失败响应（4xx），`frameIndex` 为**最早受影响帧**的 0 基下标，`message`
 只描述该帧本身，不包含对后续帧的裁决：
@@ -74,6 +81,11 @@
 | `HANDSHAKE_UNMATCHED` | 422 | act/con 缺少配对、同方向配对、con 无对应 act，或会话结束仍有 act 未配对（定位到该 act） |
 | `HANDSHAKE_OVERLAP` | 422 | 上一个同类 act 尚未收到 con 又出现新的 act |
 | `I_FRAME_OUTSIDE_PHASE` | 422 | I 帧出现在 STARTDT 确认之前或 STOPDT 确认之后 |
+| `REMOTE_CONTROL_INVALID` | 422 | Type 45 ASDU 格式/字段非法（长度、VSQ、传送原因、P/N、SCS、QOC 保留位） |
+| `REMOTE_CONTROL_MISMATCH` | 422 | 遥控原语的方向、字段（COA/IOA/SCS/QOC）、阶段不匹配，或缺选择证据即执行 |
+| `REMOTE_CONTROL_REENTRY` | 422 | 同一 (公共地址, 信息对象地址) 上一操作未终结又发起激活（含等待确认期重发、等待执行期改发选择） |
+| `REMOTE_CONTROL_TIMEOUT` | 422 | 选择正确认后超过 `maxSelectDelayUs` 仍无执行激活，定位到该操作最早的选择激活帧 |
+| `REMOTE_CONTROL_UNTERMINATED` | 422 | 会话结束仍有遥控操作悬挂（选择未确认 / 未见执行 / 执行未确认 / 缺激活终止），定位到最早的选择激活帧 |
 
 ### 核验规则要点
 
@@ -83,6 +95,26 @@
 - STARTDT/STOPDT/TESTFR 的 act 与 con 必须来自相反方向；同类 act 未确认前
   不得重发；会话结束仍悬挂的 act，定位到最早的那一帧。
 - S 帧与 TESTFR 可在任意阶段出现；STARTDT con 之后、STOPDT con 之前才允许 I 帧。
+
+### 遥控（Type 45 C_SC_NA_1，单对象）裁决要点
+
+仅当请求提供 `remoteControl.maxSelectDelayUs` 时启用，传输序号合法不再等同于
+遥控操作可采信。对每个 `(公共地址, 信息对象地址)` 独立重建证据链，不同对象的
+原语允许交错，同一对象在上一操作终结（完成或被拒）前不得重入：
+
+1. 主站发**选择激活**（COT=6，QOC 的 S/E=1）；
+2. 子站回**激活确认**（COT=7）：S/E、SCS、QU、COA、IOA 必须与选择一致。
+   P/N=0 进入待执行；P/N=1 为负确认，操作结束并计 `rejected`；
+3. 主站在选择正确认之后 `maxSelectDelayUs` 微秒内发**执行激活**（S/E=0，
+   SCS 与 QU 须与选择对应）；超时判 `REMOTE_CONTROL_TIMEOUT`；
+4. 子站回匹配的执行激活确认：正确认后进入待终止，负确认计 `rejected`；
+5. 子站再发**激活终止**（COT=10，字段与执行对应），链路完整计 `completed`。
+
+方向颠倒（如子站发激活、主站发确认/终止）、确认无对应激活、终止先于执行确认、
+字段不对应、同对象重入等均返回稳定错误码与最早 `frameIndex`；会话结束仍悬挂
+判 `REMOTE_CONTROL_UNTERMINATED`（已能由时间戳证明超时时判
+`REMOTE_CONTROL_TIMEOUT`），定位到最早的选择激活帧。ASDU 必须为 11 字节、
+VSQ=1、传送原因属于 6/7/10，且 SCS 仅 bit0、QOC 低 2 位为零。
 
 ## 运行
 
@@ -122,7 +154,7 @@ app/
   protocol.py      # APDU 解析与会话状态机（核心）
   main.py          # 标准库 HTTP 服务
   healthcheck.py   # 容器健康检查探针
-tests/             # 57 个单元 + HTTP 集成测试
+tests/             # 102 个单元 + HTTP 集成测试
 verify/
   run.sh           # 一次性核验编排
   smoke.py         # 合法/非法会话 HTTP 冒烟
