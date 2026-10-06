@@ -25,8 +25,9 @@
 | `frames` | 1–5000 帧，按 `capturedAtUs` 非递减排列 |
 | `frames[].direction` | `"client"`（主站）或 `"server"`（子站），也接受 `master`/`slave`、`primary`/`secondary` 等别名 |
 | `frames[].apdu` | 完整十六进制 APDU（起始符 0x68 + 长度 + 4 字节控制域 [+ ASDU]，允许空白分隔） |
-| `frames[].capturedAtUs` | 可选，非负整数微秒时间戳 |
+| `frames[].capturedAtUs` | 可选，非负整数微秒时间戳；启用 `remoteControl` 裁决时必填 |
 | `maxWindow` | 最大未确认窗口，1–16383 |
+| `remoteControl.maxSelectDelayUs` | 可选，遥控选择时限 1–60000000μs。省略时保持原契约（不裁决遥控证据链）；给出后对 Type 45（C_SC_NA_1）单命令 ASDU 裁决选择/执行/终止证据 |
 
 成功响应（200）：
 
@@ -48,6 +49,17 @@
 - `iFrames`：按方向统计 I 帧数。
 - `outstanding`：会话结束时各方向已发送但尚未被对端确认的 I 帧数。
 - `handshakes`：三类 U 格式服务的 act、con 总数及成功反向配对次数。
+
+启用遥控裁决（请求含 `remoteControl.maxSelectDelayUs`）时，结果新增：
+
+```json
+{ "completed": 1, "rejected": 0 }
+```
+
+- `completed`：证据链完整闭合的单命令操作数。
+- `rejected`：被子站激活确认的 P/N=1 负确认正常结束的操作数（负确认是合法
+  取证结果，审计仍 200 通过）。
+- 省略该选项时结果不含 `remoteControl`，传输层裁决与旧契约完全一致。
 
 失败响应（4xx），`frameIndex` 为**最早受影响帧**的 0 基下标，`message`
 只描述该帧本身，不包含对后续帧的裁决：
@@ -74,6 +86,7 @@
 | `HANDSHAKE_UNMATCHED` | 422 | act/con 缺少配对、同方向配对、con 无对应 act，或会话结束仍有 act 未配对（定位到该 act） |
 | `HANDSHAKE_OVERLAP` | 422 | 上一个同类 act 尚未收到 con 又出现新的 act |
 | `I_FRAME_OUTSIDE_PHASE` | 422 | I 帧出现在 STARTDT 确认之前或 STOPDT 确认之后 |
+| `REMOTE_CONTROL_REJECTED` | 422 | Type 45 遥控缺少选择/执行/终止证据，或格式、方向、命令状态、限定词、阶段不匹配、选择超时、同对象重入、会话结束仍悬挂 |
 
 ### 核验规则要点
 
@@ -83,6 +96,25 @@
 - STARTDT/STOPDT/TESTFR 的 act 与 con 必须来自相反方向；同类 act 未确认前
   不得重发；会话结束仍悬挂的 act，定位到最早的那一帧。
 - S 帧与 TESTFR 可在任意阶段出现；STARTDT con 之后、STOPDT con 之前才允许 I 帧。
+
+### 遥控（Type 45 单命令）裁决要点
+
+仅当请求显式给出 `remoteControl.maxSelectDelayUs` 时启用。启用后，传输层全部合法
+的 I 帧还要通过命令证据链核验；**控制域/传输序号合法不等于遥控操作可采信**：
+
+- 帧类型为 C_SC_NA_1（类型标识 45）、单信息对象（VSQ=`0x01`、ASDU 恰 10 字节），
+  按公共地址（2 字节）+ 信息对象地址（3 字节）标识同一对象。
+- 主站（client）先发选择激活（COT=6，QOS 的 SE=1），取得子站（server）匹配的
+  激活确认（COT=7，QOS 与激活一致）；正确认后必须在 `maxSelectDelayUs` 微秒内
+  发执行激活（COT=6，SE=0），再取得匹配的执行激活确认与激活终止（COT=10）。
+- 选择激活→执行激活的时间差以 `capturedAtUs` 度量，边界值等于时限视为合法。
+- 子站在激活确认中置 P/N=1 为负确认：操作就此结束并计入 `rejected`，
+  审计仍 200 通过；负确认的 QOS 仍须与对应激活一致。
+- 不同对象的操作允许交错；同一对象在操作闭合（completed/rejected）前禁止重入。
+- 格式、方向、命令状态（COT）、限定词（QOS）、阶段不匹配，或选择超时、
+  会话结束仍悬挂，一律返回 `REMOTE_CONTROL_REJECTED`（422），`frameIndex`
+  指向证据链中最早的相关帧（悬挂/超时通常定位到选择激活帧）。
+- 启用裁决时每一帧都必须带 `capturedAtUs`，否则按 `INVALID_REQUEST` 拒绝。
 
 ## 运行
 
@@ -122,7 +154,7 @@ app/
   protocol.py      # APDU 解析与会话状态机（核心）
   main.py          # 标准库 HTTP 服务
   healthcheck.py   # 容器健康检查探针
-tests/             # 57 个单元 + HTTP 集成测试
+tests/             # 101 个单元 + HTTP 集成测试
 verify/
   run.sh           # 一次性核验编排
   smoke.py         # 合法/非法会话 HTTP 冒烟

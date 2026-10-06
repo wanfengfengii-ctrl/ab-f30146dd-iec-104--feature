@@ -17,6 +17,17 @@ MAX_FRAMES = 5000
 MIN_WINDOW = 1
 MAX_WINDOW = 16383
 
+# 遥控选择/执行裁决参数（remoteControl.maxSelectDelayUs）
+MIN_SELECT_DELAY_US = 1
+MAX_SELECT_DELAY_US = 60_000_000
+# C_SC_NA_1：单命令（Single command），Type 45，单对象 ASDU。
+C_SC_NA_1 = 45
+_RC_ASDU_LEN = 10  # 类型(1)+VSQ(1)+COT(1)+原发地址(1)+公共地址(2)+IOA(3)+QOS(1)
+# 传输原因（COT）
+COT_ACTIVATION = 6       # 激活（主站发起选择/执行）
+COT_ACT_CONFIRM = 7      # 激活确认（子站，可带 P/N 负确认）
+COT_ACT_TERMINATION = 10  # 激活终止（子站）
+
 CLIENT = "client"
 SERVER = "server"
 DIRECTIONS = (CLIENT, SERVER)
@@ -48,7 +59,7 @@ class ErrorCode(str, Enum):
     HANDSHAKE_UNMATCHED = "HANDSHAKE_UNMATCHED"
     HANDSHAKE_OVERLAP = "HANDSHAKE_OVERLAP"
     I_FRAME_OUTSIDE_PHASE = "I_FRAME_OUTSIDE_PHASE"
-
+    REMOTE_CONTROL_REJECTED = "REMOTE_CONTROL_REJECTED"
 
 # 请求结构问题属于 400；其余为可定位到帧的协议违规，属于 422。
 _HTTP_STATUS = {
@@ -63,6 +74,7 @@ _HTTP_STATUS = {
     ErrorCode.HANDSHAKE_UNMATCHED: 422,
     ErrorCode.HANDSHAKE_OVERLAP: 422,
     ErrorCode.I_FRAME_OUTSIDE_PHASE: 422,
+    ErrorCode.REMOTE_CONTROL_REJECTED: 422,
 }
 
 
@@ -95,6 +107,31 @@ class ParsedFrame:
     recv_seq: Optional[int] = None
     u_type: Optional[str] = None  # STARTDT | STOPDT | TESTFR
     u_act: Optional[bool] = None
+    # I 帧携带的 ASDU（非 Type 45 时 rc 为 None）
+    rc: Optional["RemoteControlASDU"] = None
+
+
+@dataclass(frozen=True)
+class RemoteControlASDU:
+    """C_SC_NA_1（Type 45）单命令 ASDU 的取证要素。
+
+    结构异常（长度/VSQ）也照常提取原始字段，由会话状态机在启用遥控裁决时
+    按格式不匹配拒绝；未启用时这些帧与普通 I 帧无异。
+    """
+
+    cot: int
+    cause_tx: int
+    common_addr: int
+    ioa: int
+    qos: int
+    negative: bool
+    vsq: int
+    asdu_len: int
+
+    @property
+    def structurally_single(self) -> bool:
+        """是否为恰含一个信息对象、长度正确的单对象 ASDU。"""
+        return self.asdu_len == _RC_ASDU_LEN and self.vsq == 0x01
 
 
 _U_FUNCTIONS = {
@@ -105,6 +142,37 @@ _U_FUNCTIONS = {
     0x40: ("TESTFR", True),    # 0x43
     0x80: ("TESTFR", False),   # 0x83
 }
+
+
+def _parse_remote_control(asdu: bytes) -> Optional[RemoteControlASDU]:
+    """在 ASDU 类型标识为 C_SC_NA_1（Type 45）时提取遥控要素，否则返回 None。
+
+    结构异常（长度/VSQ）也照常提取已有字段，由会话状态机在启用遥控裁决时
+    按格式不匹配拒绝；未启用时这些帧与普通 I 帧无异。
+    """
+    if not asdu or asdu[0] != C_SC_NA_1:
+        return None
+
+    def byte_at(offset: int) -> int:
+        return asdu[offset] if offset < len(asdu) else 0
+
+    vsq = byte_at(1)
+    cot = byte_at(2) & 0x3F
+    negative = bool(byte_at(2) & 0x40)
+    cause_tx = byte_at(3)
+    common_addr = byte_at(4) | (byte_at(5) << 8)
+    ioa = byte_at(6) | (byte_at(7) << 8) | (byte_at(8) << 16)
+    qos = byte_at(9)
+    return RemoteControlASDU(
+        cot=cot,
+        cause_tx=cause_tx,
+        common_addr=common_addr,
+        ioa=ioa,
+        qos=qos,
+        negative=negative,
+        vsq=vsq,
+        asdu_len=len(asdu),
+    )
 
 
 def normalize_direction(value: object) -> Optional[str]:
@@ -157,7 +225,12 @@ def parse_apdu(raw_hex: object) -> ParsedFrame:
         # I 格式：第 1 个八字节组最低位为 0
         send_seq = ((b3 << 8) | b2) >> 1
         recv_seq = ((b5 << 8) | b4) >> 1
-        return ParsedFrame(kind="I", send_seq=send_seq, recv_seq=recv_seq)
+        return ParsedFrame(
+            kind="I",
+            send_seq=send_seq,
+            recv_seq=recv_seq,
+            rc=_parse_remote_control(data[6:]),
+        )
 
     if b2 & 0x03 == 0x01:
         # S 格式：最低两位为 01
@@ -210,6 +283,249 @@ def _opposite(direction: str) -> str:
     return SERVER if direction == CLIENT else CLIENT
 
 
+# 遥控操作的各阶段：等待选择确认 -> 等待执行 -> 等待执行确认 -> 等待终止。
+_RC_AWAIT_SELECT_CON = "await_select_con"
+_RC_AWAIT_EXEC = "await_exec"
+_RC_AWAIT_EXEC_CON = "await_exec_con"
+_RC_AWAIT_TERM = "await_term"
+
+
+@dataclass
+class _RemoteControlOp:
+    """同一（公共地址, 信息对象地址）上一次选择-执行操作的证据链状态。"""
+
+    stage: str
+    select_index: int
+    select_ts: int
+    select_qos: int
+    exec_index: int = -1
+    exec_qos: int = 0
+
+
+class _RemoteControlTracker:
+    """裁决 Type 45 单命令的选择/执行/确认/终止证据链。
+
+    不同信息对象的操作可交错；同一对象在证据链闭合（completed/rejected）前
+    不得重入。子站负确认是合法证据：操作就此结束并计入 rejected，审计仍通过；
+    格式、方向、命令状态、限定词、阶段不匹配、超时或会话结束仍悬挂则拒绝采信，
+    抛出 :class:`AuditError`，下标尽量指向证据链中最早的相关帧。
+    """
+
+    def __init__(self, max_select_delay_us: int):
+        self.max_select_delay_us = max_select_delay_us
+        self.ops: dict[tuple[int, int], _RemoteControlOp] = {}
+        self.completed = 0
+        self.rejected = 0
+
+    def _error(self, index: int, message: str) -> None:
+        raise AuditError(ErrorCode.REMOTE_CONTROL_REJECTED, index, message)
+
+    def feed(
+        self,
+        direction: str,
+        ts: int,
+        index: int,
+        rc: RemoteControlASDU,
+    ) -> None:
+        if not rc.structurally_single:
+            self._error(
+                index,
+                "遥控帧格式不匹配：C_SC_NA_1 必须为单信息对象"
+                "（VSQ=0x01）且 ASDU 恰为 10 字节",
+            )
+
+        key = (rc.common_addr, rc.ioa)
+        op = self.ops.get(key)
+        if direction == CLIENT:
+            self._feed_client(rc, key, op, ts, index)
+        else:
+            self._feed_server(rc, key, op, index)
+
+    def _feed_client(
+        self,
+        rc: RemoteControlASDU,
+        key: tuple[int, int],
+        op: Optional[_RemoteControlOp],
+        ts: int,
+        index: int,
+    ) -> None:
+        # 方向/状态：主站只能出现 COT=6 激活（选择或执行），且不携带 P/N 位。
+        if rc.negative:
+            self._error(
+                index,
+                "方向与字段不匹配：P/N 负确认位只能出现在子站的激活确认中，"
+                "主站遥控激活帧不得置位",
+            )
+        if rc.cot != COT_ACTIVATION:
+            self._error(
+                index,
+                f"方向与阶段不匹配：主站遥控帧命令状态为 COT={rc.cot}，"
+                "主站只能发送激活（COT=6）的选择或执行命令",
+            )
+
+        is_select = bool(rc.qos & 0x80)  # QOS 的 SE 位：1=选择，0=执行
+        if is_select:
+            if op is not None:
+                self._error(
+                    index,
+                    "同一公共地址/信息对象的遥控操作尚未闭合（completed/rejected）"
+                    "又发起选择激活，同一对象禁止重入",
+                )
+            self.ops[key] = _RemoteControlOp(
+                stage=_RC_AWAIT_SELECT_CON,
+                select_index=index,
+                select_ts=ts,
+                select_qos=rc.qos,
+            )
+            return
+
+        # 执行激活：必须先取得匹配的选择正确认，且落在选择时限内。
+        if op is None:
+            self._error(
+                index,
+                "阶段不匹配：执行激活之前缺少同对象选择激活及其子站正确认"
+                "（先选择、取得正确认后才允许执行）",
+            )
+        if op.stage != _RC_AWAIT_EXEC:
+            self._error(
+                index,
+                "阶段不匹配：同一公共地址/信息对象的上一条遥控操作尚未闭合"
+                "（completed/rejected）即出现执行激活，同对象不得重入",
+            )
+        delay_us = ts - op.select_ts
+        if delay_us > self.max_select_delay_us:
+            # 超时证据链最早的一帧是选择激活。
+            self._error(
+                op.select_index,
+                f"执行激活距选择激活 {delay_us}μs，超过 maxSelectDelayUs="
+                f"{self.max_select_delay_us}μs 的选择时限",
+            )
+        op.stage = _RC_AWAIT_EXEC_CON
+        op.exec_index = index
+        op.exec_qos = rc.qos
+
+    def _feed_server(
+        self,
+        rc: RemoteControlASDU,
+        key: tuple[int, int],
+        op: Optional[_RemoteControlOp],
+        index: int,
+    ) -> None:
+        if rc.cot == COT_ACT_CONFIRM:
+            self._feed_confirm(rc, key, op, index)
+            return
+        if rc.cot == COT_ACT_TERMINATION:
+            self._feed_termination(rc, op, index)
+            return
+        self._error(
+            index,
+            f"方向与阶段不匹配：子站遥控帧命令状态为 COT={rc.cot}，"
+            "子站只能发送激活确认（COT=7）或激活终止（COT=10）",
+        )
+
+    def _feed_confirm(
+        self,
+        rc: RemoteControlASDU,
+        key: tuple[int, int],
+        op: Optional[_RemoteControlOp],
+        index: int,
+    ) -> None:
+        # 必须存在来自相反方向、同公共地址/IOA 且正等待确认的选择或执行激活。
+        if op is None or op.stage not in (
+            _RC_AWAIT_SELECT_CON,
+            _RC_AWAIT_EXEC_CON,
+        ):
+            self._error(
+                index,
+                "阶段不匹配：子站激活确认没有对应的待确认选择/执行激活"
+                "（激活确认必须由相反方向的同对象激活触发）",
+            )
+        assert op is not None
+        awaiting_select = op.stage == _RC_AWAIT_SELECT_CON
+        wanted_qos = op.select_qos if awaiting_select else op.exec_qos
+        if rc.qos != wanted_qos:
+            self._error(
+                index,
+                f"字段不匹配：激活确认的限定词 QOS=0x{rc.qos:02x} 与对应激活的 "
+                f"QOS=0x{wanted_qos:02x} 不一致",
+            )
+
+        if rc.negative:
+            # 负确认是合法的取证结果：操作结束、计为 rejected，审计继续。
+            self.ops.pop(key, None)
+            self.rejected += 1
+            return
+
+        if awaiting_select:
+            op.stage = _RC_AWAIT_EXEC
+        else:
+            op.stage = _RC_AWAIT_TERM
+
+    def _feed_termination(
+        self,
+        rc: RemoteControlASDU,
+        op: Optional[_RemoteControlOp],
+        index: int,
+    ) -> None:
+        if op is None or op.stage != _RC_AWAIT_TERM:
+            self._error(
+                index,
+                "阶段不匹配：激活终止之前缺少同对象的执行激活及其正确认，"
+                "终止证据必须闭合完整的选择-执行证据链",
+            )
+        assert op is not None
+        if rc.negative:
+            self._error(
+                index,
+                "字段不匹配：激活终止（COT=10）帧不得携带 P/N=1 负确认位",
+            )
+        if rc.qos != op.exec_qos:
+            self._error(
+                index,
+                f"字段不匹配：激活终止的限定词 QOS=0x{rc.qos:02x} 与执行激活的 "
+                f"QOS=0x{op.exec_qos:02x} 不一致",
+            )
+        self.ops.pop((rc.common_addr, rc.ioa), None)
+        self.completed += 1
+
+    def finish(self, last_ts: int) -> Optional[tuple[int, str]]:
+        """会话结束时核对仍悬挂的操作，返回最早未闭合帧的下标与说明。"""
+        earliest: Optional[tuple[int, str]] = None
+        for op in self.ops.values():
+            if op.stage == _RC_AWAIT_SELECT_CON:
+                mark = (
+                    op.select_index,
+                    "会话结束时选择激活仍未取得子站匹配的激活确认",
+                )
+            elif op.stage == _RC_AWAIT_EXEC:
+                if last_ts - op.select_ts > self.max_select_delay_us:
+                    mark = (
+                        op.select_index,
+                        "选择正确认后超过 maxSelectDelayUs 选择时限"
+                        "仍未收到执行激活",
+                    )
+                else:
+                    mark = (
+                        op.select_index,
+                        "会话结束时选择激活虽已确认，但缺少时限内的执行激活、"
+                        "执行确认与激活终止证据",
+                    )
+            elif op.stage == _RC_AWAIT_EXEC_CON:
+                mark = (
+                    op.select_index,
+                    "会话结束时执行激活仍未取得子站匹配的激活确认",
+                )
+            else:  # _RC_AWAIT_TERM
+                mark = (
+                    op.select_index,
+                    "会话结束时执行激活已确认但仍缺少匹配的激活终止证据",
+                )
+            if earliest is None or mark[0] < earliest[0]:
+                earliest = mark
+        return earliest
+
+
+
 def audit_request(body: object) -> dict:
     """核验一次审计请求，成功返回结果字典，违规抛出 :class:`AuditError`。"""
     if not isinstance(body, dict):
@@ -226,6 +542,31 @@ def audit_request(body: object) -> dict:
             -1,
             f"maxWindow 必须在 {MIN_WINDOW}..{MAX_WINDOW} 之间",
         )
+
+    select_delay = None
+    remote_control = body.get("remoteControl")
+    if remote_control is not None:
+        if not isinstance(remote_control, dict):
+            raise AuditError(
+                ErrorCode.INVALID_REQUEST,
+                -1,
+                "remoteControl 必须为 JSON 对象",
+            )
+        if "maxSelectDelayUs" in remote_control:
+            select_delay = remote_control["maxSelectDelayUs"]
+            if isinstance(select_delay, bool) or not isinstance(select_delay, int):
+                raise AuditError(
+                    ErrorCode.INVALID_REQUEST,
+                    -1,
+                    "remoteControl.maxSelectDelayUs 必须为整数",
+                )
+            if not (MIN_SELECT_DELAY_US <= select_delay <= MAX_SELECT_DELAY_US):
+                raise AuditError(
+                    ErrorCode.INVALID_REQUEST,
+                    -1,
+                    f"remoteControl.maxSelectDelayUs 必须在 "
+                    f"{MIN_SELECT_DELAY_US}..{MAX_SELECT_DELAY_US} 之间",
+                )
 
     raw_frames = body.get("frames")
     if not isinstance(raw_frames, list) or not raw_frames:
@@ -279,13 +620,21 @@ def audit_request(body: object) -> dict:
         except AuditError as exc:
             # 解析期错误没有帧下标，在此绑定到当前帧。
             raise AuditError(exc.code, index, exc.message) from None
+        if select_delay is not None and captured_at is None:
+            raise AuditError(
+                ErrorCode.INVALID_REQUEST,
+                index,
+                "启用 remoteControl 裁决时每一帧都必须提供 capturedAtUs",
+            )
         frames.append((direction, captured_at, parsed))
 
-    return _audit(frames, max_window)
+    return _audit(frames, max_window, select_delay)
 
 
 def _audit(
-    frames: list[tuple[str, Optional[int], ParsedFrame]], max_window: int
+    frames: list[tuple[str, Optional[int], ParsedFrame]],
+    max_window: int,
+    select_delay: Optional[int] = None,
 ) -> dict:
     states = {CLIENT: _PeerState(), SERVER: _PeerState()}
     # 每类 U 服务至多一个待配对 act：(发起方向, 帧下标)。
@@ -301,8 +650,14 @@ def _audit(
         "u_paired": {"STARTDT": 0, "STOPDT": 0, "TESTFR": 0},
     }
     started = False
+    tracker: Optional[_RemoteControlTracker] = (
+        _RemoteControlTracker(select_delay) if select_delay is not None else None
+    )
+    last_ts: Optional[int] = None
 
-    for index, (direction, _captured_at, frame) in enumerate(frames):
+    for index, (direction, captured_at, frame) in enumerate(frames):
+        if captured_at is not None:
+            last_ts = captured_at
         peer = states[direction]
         remote = states[_opposite(direction)]
 
@@ -363,43 +718,68 @@ def _audit(
                 f"超过最大未确认窗口 {max_window}",
             )
 
+        # 传输层（控制域/序号/窗口/阶段）全部合法后，再裁决遥控命令证据链；
+        # 传输序号合法不代表遥控操作本身可采信。
+        if tracker is not None and frame.rc is not None:
+            assert captured_at is not None
+            tracker.feed(direction, captured_at, index, frame.rc)
+
     # 会话结束时仍有 act 未与相反方向 con 配对：定位最早的未配对 act。
-    earliest: Optional[tuple[int, str]] = None
+    handshake_mark: Optional[tuple[int, str]] = None
     for u_type, mark in pending.items():
         if mark is not None:
             act_index = mark[1]
-            if earliest is None or act_index < earliest[0]:
-                earliest = (
+            if handshake_mark is None or act_index < handshake_mark[0]:
+                handshake_mark = (
                     act_index,
                     f"会话结束时 {u_type} act 仍未收到相反方向的 con 配对",
                 )
-    if earliest is not None:
+
+    # 遥控操作同样可能在会话结束时仍悬挂；与 U 帧悬挂一起取最早的一帧。
+    rc_mark: Optional[tuple[int, str]] = None
+    if tracker is not None:
+        assert last_ts is not None
+        rc_mark = tracker.finish(last_ts)
+
+    if rc_mark is not None and (
+        handshake_mark is None or rc_mark[0] < handshake_mark[0]
+    ):
         raise AuditError(
-            ErrorCode.HANDSHAKE_UNMATCHED, earliest[0], earliest[1]
+            ErrorCode.REMOTE_CONTROL_REJECTED, rc_mark[0], rc_mark[1]
+        )
+    if handshake_mark is not None:
+        raise AuditError(
+            ErrorCode.HANDSHAKE_UNMATCHED,
+            handshake_mark[0],
+            handshake_mark[1],
         )
 
-    return {
-        "ok": True,
-        "result": {
-            "iFrames": {
-                CLIENT: counts["i"][CLIENT],
-                SERVER: counts["i"][SERVER],
-            },
-            "outstanding": {
-                # client 已发送但 server 尚未确认的 I 帧数，反之亦然。
-                CLIENT: states[CLIENT].next_send - states[SERVER].last_ack,
-                SERVER: states[SERVER].next_send - states[CLIENT].last_ack,
-            },
-            "handshakes": {
-                name: {
-                    "act": counts["u_act"][name],
-                    "con": counts["u_con"][name],
-                    "paired": counts["u_paired"][name],
-                }
-                for name in ("STARTDT", "STOPDT", "TESTFR")
-            },
+    result = {
+        "iFrames": {
+            CLIENT: counts["i"][CLIENT],
+            SERVER: counts["i"][SERVER],
+        },
+        "outstanding": {
+            # client 已发送但 server 尚未确认的 I 帧数，反之亦然。
+            CLIENT: states[CLIENT].next_send - states[SERVER].last_ack,
+            SERVER: states[SERVER].next_send - states[CLIENT].last_ack,
+        },
+        "handshakes": {
+            name: {
+                "act": counts["u_act"][name],
+                "con": counts["u_con"][name],
+                "paired": counts["u_paired"][name],
+            }
+            for name in ("STARTDT", "STOPDT", "TESTFR")
         },
     }
+    if tracker is not None:
+        # 省略 remoteControl 时不出现该字段，原契约保持不变。
+        result["remoteControl"] = {
+            "completed": tracker.completed,
+            "rejected": tracker.rejected,
+        }
+    return {"ok": True, "result": result}
 
 
 def _apply_u(

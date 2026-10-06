@@ -26,6 +26,19 @@ def i_frame(send: int, recv: int = 0) -> str:
     return (bytes([0x68, len(body)]) + body).hex()
 
 
+def rc_frame(send: int, recv: int, cot: int, ioa: int, qos: int,
+             pn: bool = False) -> str:
+    body = bytes(
+        [(send << 1) & 0xFF, (send << 1) >> 8,
+         (recv << 1) & 0xFF, (recv << 1) >> 8,
+         45, 0x01, (cot & 0x3F) | (0x40 if pn else 0), 0x00,
+         0x01, 0x00,
+         ioa & 0xFF, (ioa >> 8) & 0xFF, (ioa >> 16) & 0xFF,
+         qos]
+    )
+    return (bytes([0x68, len(body)]) + body).hex()
+
+
 class HttpServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -133,6 +146,76 @@ class HttpServerTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(self._url("/nope"), timeout=5)
         self.assertEqual(cm.exception.code, 404)
+
+    def test_remote_control_completed_chain(self):
+        body = {
+            "maxWindow": 16,
+            "remoteControl": {"maxSelectDelayUs": 5_000_000},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+                {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x81),
+                 "capturedAtUs": 100},
+                {"direction": "server", "apdu": rc_frame(0, 1, 7, 101, 0x81),
+                 "capturedAtUs": 101},
+                {"direction": "client", "apdu": rc_frame(1, 1, 6, 101, 0x01),
+                 "capturedAtUs": 102},
+                {"direction": "server", "apdu": rc_frame(1, 2, 7, 101, 0x01),
+                 "capturedAtUs": 103},
+                {"direction": "server", "apdu": rc_frame(2, 2, 10, 101, 0x01),
+                 "capturedAtUs": 104},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"]["remoteControl"],
+                         {"completed": 1, "rejected": 0})
+
+    def test_remote_control_negative_confirm_is_rejected_count(self):
+        body = {
+            "maxWindow": 16,
+            "remoteControl": {"maxSelectDelayUs": 5_000_000},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+                {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x81),
+                 "capturedAtUs": 100},
+                {"direction": "server", "apdu": rc_frame(0, 1, 7, 101, 0x81, pn=True),
+                 "capturedAtUs": 101},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"]["remoteControl"],
+                         {"completed": 0, "rejected": 1})
+
+    def test_remote_control_missing_select_evidence_422(self):
+        # 传输序号完全合法，但未先选择即执行，必须被拒绝而不是采信。
+        body = {
+            "maxWindow": 16,
+            "remoteControl": {"maxSelectDelayUs": 5_000_000},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+                {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+                {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x01),
+                 "capturedAtUs": 100},
+            ],
+        }
+        status, data = self._post(body)
+        self.assertEqual(status, 422)
+        self.assertEqual(data["error"]["code"], "REMOTE_CONTROL_REJECTED")
+        self.assertEqual(data["error"]["frameIndex"], 2)
+
+    def test_remote_control_bad_delay_400(self):
+        status, data = self._post({
+            "maxWindow": 16,
+            "remoteControl": {"maxSelectDelayUs": 0},
+            "frames": [
+                {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            ],
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
 
 
 if __name__ == "__main__":

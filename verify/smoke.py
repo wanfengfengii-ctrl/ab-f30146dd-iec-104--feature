@@ -28,6 +28,37 @@ def s_frame(recv: int) -> str:
     return (bytes([0x68, 4]) + body).hex()
 
 
+def rc_asdu(cot: int, ioa: int, qos: int, ca: int = 1, pn: bool = False) -> bytes:
+    """C_SC_NA_1（Type 45）单对象 ASDU。"""
+    return bytes(
+        [
+            45,
+            0x01,
+            (cot & 0x3F) | (0x40 if pn else 0),
+            0x00,
+            ca & 0xFF,
+            ca >> 8,
+            ioa & 0xFF,
+            (ioa >> 8) & 0xFF,
+            (ioa >> 16) & 0xFF,
+            qos,
+        ]
+    )
+
+
+def rc_frame(send: int, recv: int, cot: int, ioa: int, qos: int,
+             pn: bool = False, ca: int = 1) -> str:
+    """携带 C_SC_NA_1（Type 45）单对象 ASDU 的 I 帧。"""
+    return (
+        bytes([0x68, 4 + 10])
+        + bytes(
+            [(send << 1) & 0xFF, (send << 1) >> 8,
+             (recv << 1) & 0xFF, (recv << 1) >> 8]
+        )
+        + rc_asdu(cot, ioa, qos, ca, pn)
+    ).hex()
+
+
 STARTDT_ACT = "680407000000"
 STARTDT_CON = "68040b000000"
 STOPDT_ACT = "680413000000"
@@ -137,6 +168,111 @@ def main() -> int:
           status == 422 and err.get("code") == "INVALID_APDU"
           and err.get("frameIndex") == 0,
           f"{status} {err}")
+
+    # 5. 遥控合法交错：两个不同信息对象的选择-执行-终止链交错闭合
+    rc_interleave = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 5_000_000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x81),
+             "capturedAtUs": 100},  # IOA=101 选择
+            {"direction": "client", "apdu": rc_frame(1, 0, 6, 102, 0x81),
+             "capturedAtUs": 101},  # IOA=102 选择
+            {"direction": "server", "apdu": rc_frame(0, 2, 7, 101, 0x81),
+             "capturedAtUs": 102},  # 101 选择确认
+            {"direction": "server", "apdu": rc_frame(1, 2, 7, 102, 0x81),
+             "capturedAtUs": 103},  # 102 选择确认
+            {"direction": "client", "apdu": rc_frame(2, 2, 6, 101, 0x01),
+             "capturedAtUs": 104},  # 101 执行
+            {"direction": "server", "apdu": rc_frame(2, 3, 7, 101, 0x01),
+             "capturedAtUs": 105},  # 101 执行确认
+            {"direction": "server", "apdu": rc_frame(3, 3, 10, 101, 0x01),
+             "capturedAtUs": 106},  # 101 终止
+            {"direction": "client", "apdu": rc_frame(3, 4, 6, 102, 0x01),
+             "capturedAtUs": 107},  # 102 执行
+            {"direction": "server", "apdu": rc_frame(4, 4, 7, 102, 0x01),
+             "capturedAtUs": 108},  # 102 执行确认
+            {"direction": "server", "apdu": rc_frame(5, 4, 10, 102, 0x01),
+             "capturedAtUs": 109},  # 102 终止
+            {"direction": "client", "apdu": s_frame(6), "capturedAtUs": 110},
+        ],
+    }
+    status, data = post(rc_interleave)
+    rc = data.get("result", {}).get("remoteControl") if status == 200 else None
+    check("合法交错遥控链返回 200 且 completed=2",
+          status == 200 and rc == {"completed": 2, "rejected": 0},
+          f"{status} {data}")
+
+    # 6. 遥控负确认：选择被子站拒绝，操作计 rejected，审计仍通过
+    rc_negative = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 5_000_000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x81),
+             "capturedAtUs": 100},
+            {"direction": "server", "apdu": rc_frame(0, 1, 7, 101, 0x81, pn=True),
+             "capturedAtUs": 101},  # P/N=1 选择负确认
+        ],
+    }
+    status, data = post(rc_negative)
+    rc = data.get("result", {}).get("remoteControl") if status == 200 else None
+    check("选择负确认计 rejected 且审计通过",
+          status == 200 and rc == {"completed": 0, "rejected": 1},
+          f"{status} {data}")
+
+    # 7. 非法遥控链路：控制域/序号完全合法，但缺少正确的选择与终止证据
+    illegal_rc_frames = [
+        {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+        {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+        # 未先选择即直接执行（QOS SE=0）
+        {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x01),
+         "capturedAtUs": 100},
+    ]
+    illegal_rc = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 5_000_000},
+        "frames": illegal_rc_frames,
+    }
+    status, data = post(illegal_rc)
+    err = data.get("error", {})
+    check("缺少选择证据的遥控记录被拒绝（稳定错误码 + 最早下标 2）",
+          status == 422 and err.get("code") == "REMOTE_CONTROL_REJECTED"
+          and err.get("frameIndex") == 2,
+          f"{status} {err}")
+
+    # 7b. 选择与确认齐全但缺少激活终止，会话结束仍悬挂 -> 定位最早的选择帧
+    missing_term = {
+        "maxWindow": 16,
+        "remoteControl": {"maxSelectDelayUs": 5_000_000},
+        "frames": [
+            {"direction": "client", "apdu": STARTDT_ACT, "capturedAtUs": 1},
+            {"direction": "server", "apdu": STARTDT_CON, "capturedAtUs": 2},
+            {"direction": "client", "apdu": rc_frame(0, 0, 6, 101, 0x81),
+             "capturedAtUs": 100},
+            {"direction": "server", "apdu": rc_frame(0, 1, 7, 101, 0x81),
+             "capturedAtUs": 101},
+            {"direction": "client", "apdu": rc_frame(1, 1, 6, 101, 0x01),
+             "capturedAtUs": 102},
+            {"direction": "server", "apdu": rc_frame(1, 2, 7, 101, 0x01),
+             "capturedAtUs": 103},
+        ],
+    }
+    status, data = post(missing_term)
+    err = data.get("error", {})
+    check("缺少终止证据的遥控记录被拒绝（定位选择帧下标 2）",
+          status == 422 and err.get("code") == "REMOTE_CONTROL_REJECTED"
+          and err.get("frameIndex") == 2,
+          f"{status} {err}")
+
+    # 8. 省略 remoteControl 时原契约不变：结果中不含遥控裁决字段
+    status, data = post(legal)
+    check("省略 remoteControl 时结果保持原契约",
+          status == 200 and "remoteControl" not in data.get("result", {}),
+          str(data.get("result")))
 
     print("全部冒烟通过")
     return 0
